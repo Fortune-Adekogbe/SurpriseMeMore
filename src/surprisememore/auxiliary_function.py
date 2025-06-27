@@ -507,7 +507,7 @@ def jaccard_sorted_edges(adjacency_matrix):
     :return: Ordered edgelist.
     :rtype: numpy.ndarray
     """
-    G = nx.from_numpy_matrix(adjacency_matrix)
+    G = nx.from_numpy_array(adjacency_matrix)
     jacc = nx.jaccard_coefficient(G, ebunch=G.edges())
     jacc_array = []
     for u, v, p in jacc:
