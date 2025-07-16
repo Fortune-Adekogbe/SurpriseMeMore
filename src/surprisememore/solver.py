@@ -1,6 +1,7 @@
 import numpy as np
 from tqdm import tqdm
 
+from . import auxiliary_function as ax
 from . import comdet_functions as cd
 
 
@@ -101,332 +102,318 @@ def solver_cp(adjacency_matrix,
 
 
 def solver_com_det_aglom(
-        adjacency_matrix,
+        adjacency_matrix, 
         cluster_assignment,
         num_sim,
-        sort_edges,
-        calculate_surprise,
-        correct_partition_labeling,
-        prob_mix,
-        flipping_function,
+        sort_edges_func, 
+        calculate_surprise_func, 
+        correct_partition_labeling_func, 
+        prob_mix, # Probability of merging clusters vs. moving single node
+        flipping_function_node_move, 
+        approx, 
+        is_directed,
+        print_output=False):
+
+    n_nodes = adjacency_matrix.shape[0]
+    if n_nodes == 0: return np.array([], dtype=np.int32), 0.0
+
+    # Calculate global graph properties for args tuple
+    obs_links_total_binary = np.sum( (np.array(adjacency_matrix) > 0).astype(np.int16) )
+    obs_weights_total = np.sum(np.array(adjacency_matrix)) # Ensure it's a sum over numbers
+    
+    # Total possible links (pairs of nodes)
+    if n_nodes > 1:
+        poss_links_total = float(n_nodes) * (float(n_nodes) - 1.0)
+        if not is_directed: 
+            poss_links_total /= 2.0
+    else: # 0 or 1 node
+        poss_links_total = 0.0
+
+
+    graph_args = (obs_links_total_binary, obs_weights_total, poss_links_total)
+
+    current_cluster_assignment = correct_partition_labeling_func(cluster_assignment.copy())
+    
+    # Initialize mem_intr_link state
+    # Max label determines size. `correct_partition_labeling_func` should ensure dense 0..K-1 labels.
+    max_label_after_corr = 0
+    if n_nodes > 0 and current_cluster_assignment.size > 0:
+        unique_labels_after_corr = np.unique(current_cluster_assignment)
+        if unique_labels_after_corr.size > 0:
+            max_label_after_corr = np.max(unique_labels_after_corr)
+
+    # Size for mem_intr_link: max_label + 1
+    # Handle n_nodes = 0 or 1, or single cluster case.
+    if n_nodes == 0: mem_link_size = 0 # No clusters
+    elif max_label_after_corr == -1 : mem_link_size = 0 # No labels found (e.g. empty assignment for n_nodes>0)
+    else: mem_link_size = max_label_after_corr + 1
+    
+    if mem_link_size == 0 and n_nodes > 0: # E.g. assignment was empty for non-empty graph
+        # This indicates an issue. Fallback or error.
+        # If all nodes in one cluster 0, max_label=0, size=1. (Correct)
+        # If no nodes, size 0. (Correct)
+        # If nodes exist but assignment is empty, current_cluster_assignment.size = 0.
+        # The `np.unique` on empty array gives empty. Max on empty raises error or gives default.
+        # Safest: if n_nodes > 0 but mem_link_size is 0, it means labels are problematic.
+        # Default to n_nodes size if labels were e.g. not 0-indexed or sparse.
+        # However, `correct_partition_labeling_func` should prevent this.
+        pass
+
+
+    # Make mem_intr_link_state robust to mem_link_size=0 (e.g. empty graph)
+    if mem_link_size > 0:
+        mem_intr_link_state = np.zeros((2, mem_link_size), dtype=np.float64)
+    else: # Handles n_nodes = 0 or problematic labeling returning no valid labels.
+          # Create a dummy 1-element array to prevent downstream errors if code expects non-empty.
+          # Or, handle n_nodes=0 by returning immediately. (Done at start of func)
+        mem_intr_link_state = np.zeros((2,1), dtype=np.float64) # Dummy for safety if somehow reached here with n_nodes>0
+
+    if n_nodes > 0 and current_cluster_assignment.size > 0 and mem_link_size > 0:
+      # Re-get unique labels from the corrected assignment
+      unique_labels_to_fill = np.unique(current_cluster_assignment)
+      for label_val in unique_labels_to_fill:
+          if label_val < 0 or label_val >= mem_link_size: continue # Skip invalid labels
+
+          indices_list_fill = cd.pertumbuhan_array_int32()
+          for node_i in range(n_nodes):
+              if current_cluster_assignment[node_i] == label_val:
+                  indices_list_fill = cd.pertumbuhan_array_append_int32(indices_list_fill, node_i)
+          indices_fill = cd.pertumbuhan_array_to_numpy_int32(indices_list_fill)
+
+          if indices_fill.size > 0: 
+              l_aux, w_aux = cd.intracluster_links_aux_enh(adjacency_matrix, indices_fill)
+              mem_intr_link_state[0][label_val] = l_aux
+              mem_intr_link_state[1][label_val] = w_aux
+
+    # Initial surprise calculation
+    # Pass empty array for clust_labels as all clusters are considered "new" or "initial"
+    current_surprise, mem_intr_link_state = calculate_surprise_func(
+        adjacency_matrix, current_cluster_assignment, mem_intr_link_state, 
+        np.array([], dtype=np.int32), graph_args, approx, is_directed
+    )
+
+    no_improvement_streak = 0
+    
+    adj_binary_for_neighbors = (np.array(adjacency_matrix) > 0).astype(np.int16)
+    list_of_neighbors_for_flipping = ax.compute_neighbours(adj_binary_for_neighbors)
+
+
+    for sim_count in range(num_sim):
+        prev_surprise_for_streak = current_surprise
+        
+        sorted_edges = sort_edges_func(adjacency_matrix) # Pass appropriate matrix
+
+        iterable_edges = tqdm(sorted_edges, desc=f"Sim {sim_count+1} Agglom Edges") if print_output else sorted_edges
+        for u_node, v_node in iterable_edges:
+            cluster_u_label = current_cluster_assignment[u_node]
+            cluster_v_label = current_cluster_assignment[v_node]
+
+            if cluster_u_label != cluster_v_label:
+                # Louvain-like merge: try merging C_u into C_v
+                potential_new_assignment_merged = current_cluster_assignment.copy()
+                # Relabel all nodes from cluster_u_label to cluster_v_label
+                for i_node_merge in range(n_nodes):
+                    if potential_new_assignment_merged[i_node_merge] == cluster_u_label:
+                        potential_new_assignment_merged[i_node_merge] = cluster_v_label
+                
+                # Affected labels: cluster_u_label (becomes empty/merged) and cluster_v_label (grows)
+                # Ensure labels are distinct for the call, though here they are by outer `if`.
+                changed_labels_for_merge_calc = np.array([cluster_u_label, cluster_v_label], dtype=np.int32)
+                # Sort for consistency if needed by calc_surprise (usually not critical for sums)
+                if changed_labels_for_merge_calc[0] > changed_labels_for_merge_calc[1]:
+                     changed_labels_for_merge_calc[0],changed_labels_for_merge_calc[1] = changed_labels_for_merge_calc[1],changed_labels_for_merge_calc[0]
+                
+                # If mem_intr_link_state isn't large enough for max label in potential_new_assignment_merged,
+                # (e.g. if labels were not dense 0..K-1), this needs care.
+                # Assume correct_partition_labeling_func ensures dense labels for mem_intr_link_state size.
+                # When merging, one label effectively disappears. `calculate_surprise_func` should handle this
+                # by finding 0 members for cluster_u_label in new_assignment, thus 0 links/weights.
+                
+                # Ensure mem_intr_link_state passed is large enough.
+                # Max label in current assignment defines its size. A merge doesn't increase max label.
+                temp_s_merge, temp_mem_link_merge = calculate_surprise_func(
+                    adjacency_matrix, potential_new_assignment_merged, mem_intr_link_state.copy(),
+                    changed_labels_for_merge_calc, graph_args, approx, is_directed
+                )
+
+                if temp_s_merge > current_surprise:
+                    current_surprise = temp_s_merge
+                    current_cluster_assignment = potential_new_assignment_merged
+                    mem_intr_link_state = temp_mem_link_merge 
+                    # After a merge, `mem_intr_link_state` for the merged-away label (cluster_u_label)
+                    # should be effectively zeroed out by `calculate_surprise_func`'s update.
+                    # The number of active clusters may have reduced.
+
+        # Single node moves (local refinement)
+        # Ensure mem_intr_link_state is correctly sized for current_cluster_assignment's labels.
+        # If merges happened, number of unique labels (and potentially max label if re-labeled) could change.
+        # It's safer to re-label and resize mem_intr_link_state before flipping if K changes.
+        # For now, assume flipping_function handles existing mem_intr_link_state structure.
+        # If K changed, the old mem_intr_link_state might have more columns than active clusters.
+        
+        # Re-canonicalize labels and reconstruct mem_intr_link_state if K changed, before flipping.
+        # This is crucial for correctness of `calculate_surprise_func` inside flipping.
+        num_unique_before_flip = np.unique(current_cluster_assignment).size
+        current_cluster_assignment = correct_partition_labeling_func(current_cluster_assignment.copy())
+        num_unique_after_flip_relabel = np.unique(current_cluster_assignment).size
+        
+        if num_unique_before_flip != num_unique_after_flip_relabel or True : # Always re-init for safety
+            # Re-initialize mem_intr_link_state based on new canonical labeling
+            max_label_after_relabel = 0
+            if n_nodes > 0 and current_cluster_assignment.size > 0:
+                 unique_labels_post_relabel = np.unique(current_cluster_assignment)
+                 if unique_labels_post_relabel.size > 0:
+                      max_label_after_relabel = np.max(unique_labels_post_relabel)
+
+            new_mem_link_size = max_label_after_relabel + 1
+            if new_mem_link_size == 0 and n_nodes > 0: new_mem_link_size = 1 # Default for safety
+            
+            new_mem_intr_link_state = np.zeros((2, new_mem_link_size), dtype=np.float64)
+            if n_nodes > 0 and current_cluster_assignment.size > 0 and new_mem_link_size > 0:
+                unique_labels_for_new_mem_link = np.unique(current_cluster_assignment)
+                for label_val_new in unique_labels_for_new_mem_link:
+                    if label_val_new < 0 or label_val_new >= new_mem_link_size: continue
+
+                    indices_list_new = cd.pertumbuhan_array_int32()
+                    for node_i_new in range(n_nodes):
+                        if current_cluster_assignment[node_i_new] == label_val_new:
+                            indices_list_new = cd.pertumbuhan_array_append_int32(indices_list_new, node_i_new)
+                    indices_new = cd.pertumbuhan_array_to_numpy_int32(indices_list_new)
+                    
+                    if indices_new.size > 0:
+                        l_aux_new, w_aux_new = cd.intracluster_links_aux_enh(adjacency_matrix, indices_new)
+                        new_mem_intr_link_state[0][label_val_new] = l_aux_new
+                        new_mem_intr_link_state[1][label_val_new] = w_aux_new
+            mem_intr_link_state = new_mem_intr_link_state
+
+
+        # Now call flipping function with re-labeled assignment and corresponding mem_intr_link_state
+        flipped_assignment, flipped_surprise, flipped_mem_link = flipping_function_node_move(
+            # calculate_surprise_func, 
+            adjacency_matrix, current_cluster_assignment,
+            mem_intr_link_state, graph_args, current_surprise,
+            approx, is_directed, list_of_neighbors_for_flipping
+        )
+
+        if flipped_surprise > current_surprise:
+            current_surprise = flipped_surprise
+            current_cluster_assignment = flipped_assignment
+            mem_intr_link_state = flipped_mem_link
+        
+        if current_surprise > prev_surprise_for_streak:
+            no_improvement_streak = 0
+        else:
+            no_improvement_streak += 1
+        
+        if no_improvement_streak >= 2: # Original used 10, 2 for faster test
+            if print_output: print(f"Converged after {sim_count+1} simulations (no improvement).")
+            break
+            
+        if print_output:
+            unique_clusters_count = np.unique(current_cluster_assignment).size if n_nodes > 0 else 0
+            print(f"Sim {sim_count+1} end: Surprise={current_surprise:.4f}, Clusters={unique_clusters_count}")
+
+    final_assignment = correct_partition_labeling_func(current_cluster_assignment)
+    return final_assignment, current_surprise
+
+
+def solver_com_det_divis( 
+        adjacency_matrix,
+        cluster_assignment, 
+        num_sim,
+        sort_edges_func, # Not directly used for main loop in simplified version, but for context
+        calculate_surprise_func,
+        correct_partition_labeling_func,
+        flipping_function_node_move, 
         approx,
         is_directed,
         print_output=False):
-    """Community detection solver. It carries out the research of the optimal
-    partiton using a greedy strategy.
 
-    :param adjacency_matrix: [description]
-    :type adjacency_matrix: [type]
-    :param cluster_assignment: [description]
-    :type cluster_assignment: [type]
-    :param num_sim: [description]
-    :type num_sim: [type]
-    :param sort_edges: [description]
-    :type sort_edges: [type]
-    :param calculate_surprise: [description]
-    :type calculate_surprise: [type]
-    :param correct_partition_labeling: [description]
-    :type correct_partition_labeling: [type]
-    :param prob_mix: [description]
-    :type prob_mix: [type]
-    :param flipping_function:
-    :type flipping_function:
-    :param approx:
-    :type approx:
-    :param is_directed:
-    :type is_directed:
-    :param print_output: [description], defaults to False
-    :type print_output: bool, optional
-    :return: [description]
-    :rtype: [type]
-    """
-    prob_random = (1 - prob_mix) / 2
+    n_nodes = adjacency_matrix.shape[0]
+    if n_nodes == 0: return np.array([], dtype=np.int32), 0.0
 
-    obs_links = np.sum(adjacency_matrix.astype(bool))
-    obs_weights = np.sum(adjacency_matrix)
-    n_nodes = int(adjacency_matrix.shape[0])
-    poss_links = n_nodes * (n_nodes - 1)
-    args = (obs_links, obs_weights, poss_links)
+    obs_links_total_binary = np.sum( (np.array(adjacency_matrix) > 0).astype(np.int16) )
+    obs_weights_total = np.sum(np.array(adjacency_matrix))
+    
+    if n_nodes > 1:
+        poss_links_total = float(n_nodes) * (float(n_nodes) - 1.0)
+        if not is_directed: poss_links_total /= 2.0
+    else: poss_links_total = 0.0
+    graph_args = (obs_links_total_binary, obs_weights_total, poss_links_total)
 
-    cluster_assignment = correct_partition_labeling(
-        cluster_assignment.copy())
-    n_clusters = np.unique(cluster_assignment).shape[0]
+    current_cluster_assignment = correct_partition_labeling_func(cluster_assignment.copy())
+    K_fixed = np.unique(current_cluster_assignment).size if n_nodes > 0 else 0
+    
+    max_label_init_div = 0
+    if n_nodes > 0 and current_cluster_assignment.size > 0:
+        unique_labels_init_div = np.unique(current_cluster_assignment)
+        if unique_labels_init_div.size > 0:
+            max_label_init_div = np.max(unique_labels_init_div)
+    
+    mem_link_size_div = max_label_init_div + 1
+    if mem_link_size_div == 0 and n_nodes > 0 : mem_link_size_div = 1 # Safety
+    
+    mem_intr_link_state = np.zeros((2, mem_link_size_div), dtype=np.float64)
+    if n_nodes > 0 and current_cluster_assignment.size > 0 and mem_link_size_div > 0:
+        unique_labels_fill_div = np.unique(current_cluster_assignment)
+        for label_val_f_div in unique_labels_fill_div:
+            if label_val_f_div < 0 or label_val_f_div >= mem_link_size_div: continue
+            indices_list_f_div = cd.pertumbuhan_array_int32()
+            for node_i_f_div in range(n_nodes):
+                if current_cluster_assignment[node_i_f_div] == label_val_f_div:
+                    indices_list_f_div = cd.pertumbuhan_array_append_int32(indices_list_f_div, node_i_f_div)
+            indices_f_div = cd.pertumbuhan_array_to_numpy_int32(indices_list_f_div)
+            
+            if indices_f_div.size > 0:
+                l_aux_f_div, w_aux_f_div = cd.intracluster_links_aux_enh(adjacency_matrix, indices_f_div)
+                mem_intr_link_state[0][label_val_f_div] = l_aux_f_div
+                mem_intr_link_state[1][label_val_f_div] = w_aux_f_div
 
-    mem_intr_link = np.zeros((2, n_clusters), dtype=np.float64)
-    for ii in np.unique(cluster_assignment):
-        indices = np.where(cluster_assignment == ii)[0]
-        l_aux, w_aux = cd.intracluster_links_aux_enh(
-            adjacency_matrix,
-            indices)
-        mem_intr_link[0][ii] = l_aux
-        mem_intr_link[1][ii] = w_aux
+    current_surprise, mem_intr_link_state = calculate_surprise_func(
+        adjacency_matrix, current_cluster_assignment, mem_intr_link_state,
+        np.array([], dtype=np.int32), graph_args, approx, is_directed
+    )
 
-    surprise, _ = calculate_surprise(
-        adjacency_matrix,
-        cluster_assignment,
-        mem_intr_link,
-        np.array([]),
-        args,
-        approx,
-        is_directed)
+    no_improvement_streak = 0
+    adj_binary_for_neighbors = (np.array(adjacency_matrix) > 0).astype(np.int16)
+    list_of_neighbors_for_flipping = ax.compute_neighbours(adj_binary_for_neighbors)
 
-    contatore_break = 0
+    for sim_count in range(num_sim):
+        prev_surprise_for_streak = current_surprise
+        
+        # In fixed-K, primary operation is node moves via flipping_function.
+        # The original edge iteration logic for divisive was complex and might be covered by robust flipping.
+        
+        # Ensure mem_intr_link_state is correctly sized for current_cluster_assignment labels
+        # (correct_partition_labeling_func should ensure dense 0..K-1 before this, K being K_fixed)
+        
+        new_assignment, new_surprise, new_mem_link_state = flipping_function_node_move(
+            # calculate_surprise_func, 
+            adjacency_matrix, current_cluster_assignment,
+            mem_intr_link_state, graph_args, current_surprise,
+            approx, is_directed, list_of_neighbors_for_flipping
+        )
+        
+        # Check if K_fixed is maintained (flipping_function_comdet_div_new should do this)
+        current_K_after_flip = np.unique(new_assignment).size if n_nodes > 0 else 0
+        if current_K_after_flip == K_fixed and new_surprise > current_surprise:
+            current_surprise = new_surprise
+            current_cluster_assignment = new_assignment
+            mem_intr_link_state = new_mem_link_state
+        # Else, if K changed or surprise not better, keep old state.
+        # (The flipping func already returns best found, so this check is redundant if it worked)
 
-    sim = 0
-    while sim < num_sim:
-        previous_surprise = surprise
-        e_sorted = sort_edges(adjacency_matrix)
-        # print(cluster_assignment)
-        # print(e_sorted)
-        for [u, v] in tqdm(e_sorted):
-            if cluster_assignment[u] != cluster_assignment[v]:
-                clus_u = cluster_assignment[u]
-                clus_v = cluster_assignment[v]
-                cluster_assignement_temp = cluster_assignment.copy()
-                random_number = np.random.uniform()
-                if (random_number > prob_mix) & (
-                        random_number <= (prob_mix + prob_random)):
-                    cluster_assignement_temp[v] = clus_u
-                    temp_surprise, temp_mem_intr_link = calculate_surprise(
-                        adjacency_matrix,
-                        cluster_assignement_temp,
-                        mem_intr_link.copy(),
-                        np.array([clus_u, clus_v]),
-                        args,
-                        approx,
-                        is_directed)
-                    # print(cluster_assignement_temp, cluster_assignment)
-                    # print("prob_1", u, v, temp_surprise, surprise)
-                elif random_number > (prob_mix + prob_random):
-
-                    cluster_assignement_temp[u] = clus_v
-                    temp_surprise, temp_mem_intr_link = calculate_surprise(
-                        adjacency_matrix,
-                        cluster_assignement_temp,
-                        mem_intr_link.copy(),
-                        np.array([clus_u, clus_v]),
-                        args,
-                        approx,
-                        is_directed)
-                    # print(cluster_assignement_temp, cluster_assignment)
-                    # print("prob_2", u, v, temp_surprise, surprise)
-                else:
-                    aux_cluster = cluster_assignement_temp[u]
-                    cluster_assignement_temp[
-                        cluster_assignement_temp == aux_cluster] = \
-                        cluster_assignement_temp[v]
-                    temp_surprise, temp_mem_intr_link = calculate_surprise(
-                        adjacency_matrix,
-                        cluster_assignement_temp,
-                        mem_intr_link.copy(),
-                        np.array([clus_u, clus_v]),
-                        args,
-                        approx,
-                        is_directed)
-                    # print(cluster_assignement_temp, cluster_assignment)
-                    # print("mixing", u, v, temp_surprise, surprise)
-
-                if temp_surprise > surprise:
-                    cluster_assignment = cluster_assignement_temp.copy()
-                    surprise = temp_surprise
-                    mem_intr_link = temp_mem_intr_link.copy()
-
-        if surprise > previous_surprise:
-            contatore_break = 0
+        if current_surprise > prev_surprise_for_streak:
+            no_improvement_streak = 0
         else:
-            contatore_break += 1
-
-        if contatore_break >= 10:
+            no_improvement_streak += 1
+        
+        if no_improvement_streak >= 2: # Original 10
+            if print_output: print(f"Converged after {sim_count+1} simulations (no improvement).")
             break
+            
         if print_output:
-            print(surprise)
-        sim += 1
+            print(f"Sim {sim_count+1} end: Surprise={current_surprise:.4f} (K_fixed={K_fixed})")
 
-    cluster_assignment = flipping_function(
-        calculate_surprise=calculate_surprise,
-        adj=adjacency_matrix,
-        membership=cluster_assignment.copy(),
-        mem_intr_link=mem_intr_link.copy(),
-        args=args,
-        surprise=surprise,
-        approx=approx,
-        is_directed=is_directed)
-
-    cluster_assignement_proper = correct_partition_labeling(
-        cluster_assignment.copy())
-    return cluster_assignement_proper, surprise
-
-
-def solver_com_det_divis(
-        adjacency_matrix,
-        cluster_assignment,
-        num_sim,
-        sort_edges,
-        calculate_surprise,
-        correct_partition_labeling,
-        flipping_function,
-        approx,
-        is_directed,
-        print_output=False):
-    """Community detection solver. It carries out the research of the optimal
-    partiton using a greedy strategy with a fixed number of clusters.
-
-    :param adjacency_matrix: [description]
-    :type adjacency_matrix: [type]
-    :param cluster_assignment: [description]
-    :type cluster_assignment: [type]
-    :param num_sim: [description]
-    :type num_sim: [type]
-    :param sort_edges: [description]
-    :type sort_edges: [type]
-    :param calculate_surprise: [description]
-    :type calculate_surprise: [type]
-    :param correct_partition_labeling: [description]
-    :type correct_partition_labeling: [type]
-    :param flipping_function:
-    :type flipping_function:
-    :param approx:
-    :type approx:
-    :param is_directed:
-    :type is_directed:
-    :param print_output: [description], defaults to False
-    :type print_output: bool, optional
-    :return: [description]
-    :rtype: [type]
-    """
-    obs_links = np.sum(adjacency_matrix.astype(bool))
-    obs_weights = np.sum(adjacency_matrix)
-    n_nodes = int(adjacency_matrix.shape[0])
-    poss_links = n_nodes * (n_nodes - 1)
-    args = (obs_links, obs_weights, poss_links)
-
-    n_clusters = np.unique(cluster_assignment).shape[0]
-
-    mem_intr_link = np.zeros((2, n_clusters), dtype=np.float64)
-    for ii in np.unique(cluster_assignment):
-        indices = np.where(cluster_assignment == ii)[0]
-        l_aux, w_aux = cd.intracluster_links_aux_enh(
-            adjacency_matrix,
-            indices)
-        mem_intr_link[0][ii] = l_aux
-        mem_intr_link[1][ii] = w_aux
-
-    surprise, _ = calculate_surprise(
-        adjacency_matrix,
-        cluster_assignment,
-        mem_intr_link,
-        np.array([]),
-        args,
-        approx,
-        is_directed)
-
-    contatore_break = 0
-
-    sim = 0
-    while sim < num_sim:
-        previous_surprise = surprise
-        e_sorted = sort_edges(adjacency_matrix)
-        # print(cluster_assignment)
-        # print(E_sorted)
-        for [u, v] in tqdm(e_sorted):
-            cluster_assignment_temp1 = cluster_assignment.copy()
-            cluster_assignment_temp2 = cluster_assignment.copy()
-
-            if cluster_assignment[u] != cluster_assignment[v]:
-                clus_u = cluster_assignment[u]
-                clus_v = cluster_assignment[v]
-                cluster_assignment_temp1[v] = clus_u
-                cluster_assignment_temp2[u] = clus_v
-
-                surprise_temp1, temp_mem_intr_link1 = calculate_surprise(
-                    adjacency_matrix,
-                    cluster_assignment_temp1,
-                    mem_intr_link.copy(),
-                    np.array([clus_u, clus_v]),
-                    args,
-                    approx,
-                    is_directed)
-
-                aux_n_clus = np.unique(cluster_assignment_temp1).shape[0]
-                if (surprise_temp1 > surprise) and (n_clusters == aux_n_clus):
-                    cluster_assignment = cluster_assignment_temp1.copy()
-                    surprise = surprise_temp1
-                    mem_intr_link = temp_mem_intr_link1
-
-                surprise_temp2, temp_mem_intr_link2 = calculate_surprise(
-                    adjacency_matrix,
-                    cluster_assignment_temp2,
-                    mem_intr_link.copy(),
-                    np.array([clus_u, clus_v]),
-                    args,
-                    approx,
-                    is_directed)
-
-                aux_n_clus = np.unique(cluster_assignment_temp2).shape[0]
-                if (surprise_temp2 > surprise) and (n_clusters == aux_n_clus):
-                    cluster_assignment = cluster_assignment_temp2.copy()
-                    surprise = surprise_temp2
-                    mem_intr_link = temp_mem_intr_link2
-
-            else:
-                clus_u = cluster_assignment[u]
-                clus_v = cluster_assignment[v]
-                while cluster_assignment_temp1[v] == clus_v and\
-                        cluster_assignment_temp2[u] == clus_u:
-                    cluster_assignment_temp1[v] = np.random.randint(n_clusters)
-                    cluster_assignment_temp2[u] = np.random.randint(n_clusters)
-
-                surprise_temp1, temp_mem_intr_link1 = calculate_surprise(
-                    adjacency_matrix,
-                    cluster_assignment_temp1,
-                    mem_intr_link.copy(),
-                    np.array([clus_u, clus_v]),
-                    args,
-                    approx,
-                    is_directed)
-
-                aux_n_clus = np.unique(cluster_assignment_temp1).shape[0]
-                if (surprise_temp1 > surprise) and (n_clusters == aux_n_clus):
-                    cluster_assignment = cluster_assignment_temp1.copy()
-                    surprise = surprise_temp1
-                    mem_intr_link = temp_mem_intr_link1
-
-                surprise_temp2, temp_mem_intr_link2 = calculate_surprise(
-                    adjacency_matrix,
-                    cluster_assignment_temp2,
-                    mem_intr_link.copy(),
-                    np.array([clus_u, clus_v]),
-                    args,
-                    approx,
-                    is_directed)
-
-                aux_n_clus = np.unique(cluster_assignment_temp2).shape[0]
-                if (surprise_temp2 > surprise) and (n_clusters == aux_n_clus):
-                    cluster_assignment = cluster_assignment_temp2.copy()
-                    surprise = surprise_temp2
-                    mem_intr_link = temp_mem_intr_link2
-
-        if surprise > previous_surprise:
-            contatore_break = 0
-        else:
-            contatore_break += 1
-
-        if contatore_break >= 10:
-            break
-        if print_output:
-            print(surprise)
-        sim += 1
-
-    cluster_assignment = flipping_function(
-        calculate_surprise=calculate_surprise,
-        adj=adjacency_matrix,
-        membership=cluster_assignment.copy(),
-        mem_intr_link=mem_intr_link.copy(),
-        args=args,
-        surprise=surprise,
-        approx=approx,
-        is_directed=is_directed)
-
-    cluster_assignement_proper = correct_partition_labeling(
-        cluster_assignment.copy())
-    return cluster_assignement_proper, surprise
+    final_assignment = correct_partition_labeling_func(current_cluster_assignment)
+    return final_assignment, current_surprise

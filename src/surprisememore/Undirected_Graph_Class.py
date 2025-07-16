@@ -444,6 +444,155 @@ class UndirectedGraph:
 
         self._set_solved_problem(sol)
 
+    def run_discrete_community_detection_new(
+        self,
+        method="agglomerative", 
+        initial_guess="random",
+        weighted=None,
+        num_sim=2, 
+        num_clusters=None, 
+        sorting_method="random", 
+        is_directed_graph=False,
+        print_output=False
+    ):
+        self._initialize_problem_cd(
+            method=method,
+            num_clusters=num_clusters,
+            initial_guess=initial_guess,
+            enhanced=False,
+            weighted=weighted,
+            continuous=False,
+            sorting_method=sorting_method
+        )
+
+        approx_method_surprise = None 
+
+        if method == "agglomerative":
+            sol = solver.solver_com_det_aglom(
+                self.aux_adj, 
+                self.init_guess, 
+                num_sim,
+                self.sorting_function, 
+                self.surprise_function, 
+                self.partition_labeler,
+                0.1, 
+                cd.flipping_function_comdet_agl_new, 
+                approx_method_surprise, 
+                is_directed_graph, 
+                print_output
+            )
+        elif method == "fixed-clusters":
+            if num_clusters is None: raise ValueError("num_clusters required.")
+            # Ensure initial guess for fixed-K has K unique labels by re-labeling if needed.
+            # Or, assume `fixed_clusters_init_guess_cn` produces K labels.
+            # If random init, it produces labels 0..K-1.
+            # If `common_neigh` for fixed-K, it also aims for K labels.
+            # The solver itself will operate on the K from the initial partition.
+            
+            sol = solver.solver_com_det_divis(
+                self.aux_adj, 
+                self.init_guess, num_sim,
+                self.sorting_function, 
+                self.surprise_function, 
+                self.partition_labeler,
+                cd.flipping_function_comdet_agl_new, 
+                approx_method_surprise, 
+                is_directed_graph, 
+                print_output
+            )
+        else: raise ValueError(f"Unsupported method: {method}")
+
+        self._set_solved_problem(sol)
+
+    def run_weighted_discrete_community_detection(
+        self,
+        method="agglomerative", 
+        initial_guess="random", 
+        num_sim=2, 
+        num_clusters=None, 
+        sorting_method="random", 
+        is_directed_graph=False,
+        print_output=False
+    ):
+        n_nodes = self.aux_adj.shape[0]
+        if n_nodes == 0:
+            return np.array([], dtype=np.int32), 0.0, 1.0 
+
+        adjacency_matrix_binary = (np.array(self.aux_adj) > 0).astype(np.int16)
+
+        if isinstance(initial_guess, str):
+            if initial_guess == "random":
+                if method == "agglomerative":
+                    init_guess_partition = np.arange(n_nodes, dtype=np.int32)
+                elif method == "fixed-clusters":
+                    if num_clusters is None: raise ValueError("num_clusters required.")
+                    if not (0 < num_clusters <= n_nodes): raise ValueError("Invalid num_clusters.")
+                    init_guess_partition = np.random.randint(low=0, high=num_clusters, size=n_nodes, dtype=np.int32)
+            elif initial_guess == "common-neigh-weak":
+                if method == "agglomerative": init_guess_partition = ax.common_neigh_init_guess_weak(adjacency_matrix_binary)
+                elif method == "fixed-clusters":
+                    if num_clusters is None: raise ValueError("num_clusters required.")
+                    init_guess_partition = ax.fixed_clusters_init_guess_cn(adjacency_matrix_binary, num_clusters)
+            elif initial_guess == "common-neigh-strong":
+                if method == "agglomerative": init_guess_partition = ax.common_neigh_init_guess_strong(adjacency_matrix_binary)
+                elif method == "fixed-clusters":
+                    if num_clusters is None: raise ValueError("num_clusters required.")
+                    init_guess_partition = ax.fixed_clusters_init_guess_cn(adjacency_matrix_binary, num_clusters)
+            else: raise ValueError(f"Unknown initial_guess string: {initial_guess}")
+        elif isinstance(initial_guess, (np.ndarray, list)):
+            init_guess_partition = np.array(initial_guess, dtype=np.int32)
+            if init_guess_partition.shape[0] != n_nodes: raise ValueError("Custom guess length mismatch.")
+            if method == "fixed-clusters":
+                if num_clusters is None: raise ValueError("num_clusters required.")
+                # Optional: check if custom guess matches num_clusters unique labels.
+                # For now, allow flexibility, solver will work with actual K from init_guess.
+        else: raise TypeError("initial_guess type error.")
+
+        if sorting_method == "random":
+            sort_edges_function = lambda adj_matrix_for_sort: ax.shuffled_edges(adj_matrix_for_sort, is_directed_graph)
+        else: raise ValueError(f"Unsupported sorting_method: {sorting_method}")
+        
+        surprise_calc_function = cd.calculate_surprise_logsum_clust_weigh_new
+        approx_method_surprise = None 
+
+        if method == "agglomerative":
+            solution, log_s = solver.solver_com_det_aglom(
+                self.aux_adj, init_guess_partition, num_sim,
+                sort_edges_function, surprise_calc_function, cd.labeling_communities,
+                0.1, cd.flipping_function_comdet_agl_new, 
+                approx_method_surprise, is_directed_graph, print_output
+            )
+        elif method == "fixed-clusters":
+            if num_clusters is None: raise ValueError("num_clusters required.")
+            # Ensure initial guess for fixed-K has K unique labels by re-labeling if needed.
+            # Or, assume `fixed_clusters_init_guess_cn` produces K labels.
+            # If random init, it produces labels 0..K-1.
+            # If `common_neigh` for fixed-K, it also aims for K labels.
+            # The solver itself will operate on the K from the initial partition.
+            
+            solution, log_s = solver.solver_com_det_divis(
+                self.aux_adj, init_guess_partition, num_sim,
+                sort_edges_function, surprise_calc_function, cd.labeling_communities,
+                cd.flipping_function_comdet_div_new, 
+                approx_method_surprise, is_directed_graph, print_output
+            )
+        else: raise ValueError(f"Unsupported method: {method}")
+
+        s_val = 0.0
+        if log_s is not None and not np.isinf(log_s) and not np.isnan(log_s):
+            try:
+                s_val = 10**(-log_s)
+            except OverflowError: # log_s is very large negative (S very large positive, bad) or very large positive (S near 0)
+                if -log_s > 700: s_val = np.inf # Effectively
+                elif -log_s < -700: s_val = 0.0
+                else: s_val = 0.0 # Fallback for other calculation issues with 10**
+        elif np.isinf(log_s) and log_s > 0: # logS = inf => S = inf (bad) or -logS = -inf => S = inf
+            s_val = np.inf # Or handle as error / max float
+        
+        self.solution = solution
+        self.log_surprise = log_s
+        self.surprise = s_val
+
     def _initialize_problem_cd(self,
                                method,
                                num_clusters,

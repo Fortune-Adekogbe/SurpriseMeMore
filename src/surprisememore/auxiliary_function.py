@@ -19,61 +19,96 @@ def compute_neighbours_alt(adj):
 
 
 @jit(nopython=True)
-def compute_max_neighbor(node, neighbors):
-    max_cn = 0
-    index_max_cn = 0
-    node_ng = neighbors[node]
-    for ii, ng in enumerate(neighbors.values()):
-        if ii != node:
-            aux_cn = intersection(node_ng, ng)
-            if aux_cn > max_cn:
-                max_cn = aux_cn
-                index_max_cn = ii
+def compute_max_neighbor(node_idx, neighbors_dict, num_nodes): 
+    max_cn = -1 
+    index_max_cn = node_idx 
+
+    # Check if node_idx is in neighbors_dict (it should be if dict is built for 0..num_nodes-1)
+    if node_idx not in neighbors_dict: return index_max_cn # Should not happen
+    node_ng = neighbors_dict[node_idx]
+
+    if not node_ng.size: 
+        return index_max_cn 
+
+    for ii in range(num_nodes): 
+        if ii == node_idx:
+            continue
+        
+        if ii not in neighbors_dict: continue # Should not happen
+        ng_ii = neighbors_dict[ii]
+        if not ng_ii.size: 
+            continue
+            
+        aux_cn = intersection(node_ng, ng_ii)
+        if aux_cn > max_cn:
+            max_cn = aux_cn
+            index_max_cn = ii
+        elif aux_cn == max_cn: 
+             # Tie-breaking: prefer smaller index if that was the original intent.
+            if ii < index_max_cn : index_max_cn = ii
+            
     return index_max_cn
 
 
 @jit(nopython=True)
 def intersection(arr1, arr2):
-    m = List([1])
-    m.pop()
     intersect = 0
-    if arr1.shape[0] < arr2.shape[0]:
-        for i in arr2:
-            if i in arr1:
-                intersect+=1
-    else:
-        for i in arr1:
-            if i in arr2:
-                intersect+=1
+    if arr1.shape[0] > arr2.shape[0]:
+        arr1, arr2 = arr2, arr1 
+    
+    for i_val in arr1:
+        # Numba's 'in' operator on arrays can be slow for large arrays.
+        # For typical neighbor lists, this might be okay.
+        # If performance is an issue here, and arrays are sorted, a merge-like scan is better.
+        # If unsorted and large, set intersection logic (not directly available in nopython mode without workarounds).
+        is_present = False
+        for j_val in arr2:
+            if i_val == j_val:
+                is_present = True
+                break
+        if is_present:
+            intersect += 1
+            
     return intersect
 
 
 def compute_neighbours(adj):
     lista_neigh = []
     for ii in np.arange(adj.shape[0]):
-        lista_neigh.append(adj[ii, :].nonzero()[0])
+        if hasattr(adj, "tobsr"): 
+            lista_neigh.append(adj[ii, :].nonzero()[1])
+        else: 
+            lista_neigh.append(np.where(adj[ii, :])[0])
     return lista_neigh
 
 
 @jit(nopython=True)
-def compute_cn(adjacency):
-    """ Computes common neighbours table, each entry i,j of this table is the
-     number of common neighbours between i and j.
+def compute_cn(adjacency_binary):
+    num_nodes = adjacency_binary.shape[0]
+    cn_table = np.zeros((num_nodes, num_nodes), dtype=adjacency_binary.dtype) 
+    
+    # Precompute neighbor representations for all nodes if graph is undirected-like logic
+    # For common successors (directed): use adj[i,:] and adj[j,:]
+    # For common predecessors: use adj[:,i] and adj[:,j]
+    # Original code's (adj[i,:] + adj[:,i]).astype(bool) implies undirected interpretation of "neighbor"
+    
+    node_influence_sets = [ (adjacency_binary[i, :] + adjacency_binary[:, i]).astype(np.bool_) for i in range(num_nodes) ]
 
-    :param adjacency: Adjacency matrix.
-    :type adjacency: numpy.ndarray
-    :return: Common neighbours table.
-    :rtype: numpy.ndarray
-    """
-    cn_table = np.zeros_like(adjacency)
-    for i in np.arange(adjacency.shape[0]):
-        neighbour_i = (adjacency[i, :] + adjacency[:, i]).astype(np.bool_)
-        for j in np.arange(i + 1, adjacency.shape[0]):
-            neighbour_j = (adjacency[j, :] + adjacency[:, j]).astype(np.bool_)
-            cn_table[i, j] = cn_table[j, i] = np.multiply(neighbour_i,
-                                                          neighbour_j).sum()
+    for i in np.arange(num_nodes):
+        neighbour_i_infl = node_influence_sets[i]
+        for j in np.arange(i + 1, num_nodes):
+            neighbour_j_infl = node_influence_sets[j]
+            # Common neighbors based on this "influence set"
+            cn_val = 0
+            for k_node in range(num_nodes): # Iterate over all possible common neighbors
+                if neighbour_i_infl[k_node] and neighbour_j_infl[k_node]:
+                    cn_val +=1
+            cn_table[i, j] = cn_table[j, i] = cn_val
+            # Original: np.sum(np.logical_and(neighbour_i, neighbour_j))
+            # This might be faster if Numba optimizes array ops well.
+            # cn_table[i, j] = cn_table[j, i] = np.sum(np.logical_and(neighbour_i_infl, neighbour_j_infl))
+
     return cn_table
-
 
 @jit(nopython=True)
 def common_neigh_init_guess_strong_old(adjacency):
@@ -97,23 +132,33 @@ def common_neigh_init_guess_strong_old(adjacency):
 
 
 @jit(nopython=True)
-def common_neigh_init_guess_strong(adjacency):
-    """Generates a preprocessed initial guess based on the common neighbours
-     of nodes. It makes a stronger aggregation of nodes based on
-      the common neighbours similarity.
+def common_neigh_init_guess_strong(adjacency_binary):
+    num_nodes = adjacency_binary.shape[0]
+    # Make sure neighbors_dict keys are compatible with NumbaDict if it were used explicitly
+    # For untyped dict passed to JIT func, Numba tries to infer.
+    # Explicit Numba typed.Dict could be more robust if issues arise.
+    neighbors = compute_neighbours_alt(adjacency_binary) 
+    memberships = np.arange(num_nodes, dtype=np.int32)
+    
+    degrees = np.zeros(num_nodes, dtype=np.int32)
+    is_symmetric_adj = np.all(adjacency_binary == adjacency_binary.T) # Correct symmetry check
 
-    :param adjacency: Adjacency matrix.
-    :type adjacency: numpy.ndarray
-    :return: Initial guess for nodes memberships.
-    :rtype: np.array
-    """
-    neighbors = compute_neighbours_alt(adjacency)
-    memberships = np.array(
-        [k for k in np.arange(adjacency.shape[0], dtype=np.int32)])
-    argsorted = np.argsort(adjacency.astype(np.bool_).sum(axis=1))[::-1]
-    for aux_node1 in argsorted:
-        aux_tmp = memberships == aux_node1
-        memberships[aux_tmp] = memberships[compute_max_neighbor(aux_node1, neighbors)]
+    for i in range(num_nodes):
+        degrees[i] = np.sum(adjacency_binary[i, :])
+        if not is_symmetric_adj: 
+             degrees[i] += np.sum(adjacency_binary[:, i])
+
+    argsorted_degrees = np.argsort(degrees)[::-1]
+
+    for aux_node1 in argsorted_degrees:
+        current_membership_val = memberships[aux_node1]
+        idx_max_cn_node = compute_max_neighbor(aux_node1, neighbors, num_nodes)
+        target_membership_val = memberships[idx_max_cn_node]
+        
+        if current_membership_val != target_membership_val: 
+            for i in range(num_nodes):
+                if memberships[i] == current_membership_val:
+                    memberships[i] = target_membership_val
     return memberships
 
 
@@ -143,27 +188,37 @@ def common_neigh_init_guess_weak_old(adjacency):
 
 
 @jit(nopython=True)
-def common_neigh_init_guess_weak(adjacency):
-    """Generates a preprocessed initial guess based on the common neighbours
-     of nodes. It makes a weaker aggregation of nodes based on
-      the common neighbours similarity.
+def common_neigh_init_guess_weak(adjacency_binary):
+    num_nodes = adjacency_binary.shape[0]
+    neighbors = compute_neighbours_alt(adjacency_binary)
+    memberships = np.arange(num_nodes, dtype=np.int32)
 
-    :param adjacency: Adjacency matrix.
-    :type adjacency: numpy.ndarray
-    :return: Initial guess for nodes memberships.
-    :rtype: np.array
-    """
-    neighbors = compute_neighbours_alt(adjacency)
-    memberships = np.array(
-        [k for k in np.arange(adjacency.shape[0], dtype=np.int32)])
-    degree = (adjacency.astype(np.bool_).sum(axis=1)
-              + adjacency.astype(np.bool_).sum(axis=0))
-    avg_degree = np.mean(degree)
-    argsorted = np.argsort(degree)[::-1]
-    for aux_node1 in argsorted:
-        if degree[aux_node1] >= avg_degree:
-            aux_tmp = memberships == aux_node1
-            memberships[aux_tmp] = memberships[compute_max_neighbor(aux_node1, neighbors)]
+    degrees = np.zeros(num_nodes, dtype=np.int32)
+    is_symmetric_adj = np.all(adjacency_binary == adjacency_binary.T) # Correct symmetry check
+
+    for i in range(num_nodes):
+        degrees[i] = np.sum(adjacency_binary[i, :])
+        if not is_symmetric_adj:
+             degrees[i] += np.sum(adjacency_binary[:, i])
+    
+    avg_degree = 0.0
+    if num_nodes > 0 : 
+        sum_deg = 0
+        for d_val in degrees: sum_deg += d_val
+        avg_degree = float(sum_deg) / num_nodes
+    
+    argsorted_degrees = np.argsort(degrees)[::-1]
+
+    for aux_node1 in argsorted_degrees:
+        if degrees[aux_node1] >= avg_degree:
+            current_membership_val = memberships[aux_node1]
+            idx_max_cn_node = compute_max_neighbor(aux_node1, neighbors, num_nodes)
+            target_membership_val = memberships[idx_max_cn_node]
+            
+            if current_membership_val != target_membership_val:
+                for i in range(num_nodes):
+                    if memberships[i] == current_membership_val:
+                        memberships[i] = target_membership_val
     return memberships
 
 
@@ -199,66 +254,88 @@ def eigenvector_init_guess(adjacency, is_directed):
     return membership
 
 
-def fixed_clusters_init_guess_cn(adjacency, n_clust):
-    """ Generates an intial guess with a fixed number 'n' of clusters.
-    Nodes are organised in clusters based on the number of common neighbors.
-    The starting members of clusters are the 'n' nodes with higher
-    degrees/strengths.
+def fixed_clusters_init_guess_cn(adjacency_binary, n_clust):
+    num_nodes = adjacency_binary.shape[0]
+    
+    if n_clust <= 0 : # Handle n_clust=0 or negative
+        if num_nodes > 0: return np.zeros(num_nodes, dtype=np.int32)
+        else: return np.array([], dtype=np.int32)
 
-    :param adjacency: Adjacency matrix.
-    :type adjacency: numpy.ndarray
-    :param n_clust: Partitions number.
-    :type n_clust: int
-    :return: Initial guess.
-    :rtype: numpy.ndarray
-    """
+    aux_memb = np.zeros(num_nodes, dtype=np.int32) # Default to cluster 0
 
-    aux_memb = np.ones(adjacency.shape[0], dtype=np.int32) * (n_clust - 1)
+    cn = compute_cn(adjacency_binary)
+    
+    degrees = np.zeros(num_nodes, dtype=np.int32)
+    is_symmetric_adj = np.all(adjacency_binary == adjacency_binary.T) # Correct symmetry check
 
-    cn = compute_cn(adjacency)
-    degree = adjacency.astype(np.bool_).sum(axis=1) + adjacency.astype(
-        np.bool_).sum(axis=0)
-    avg_degree = np.mean(degree)
-    degree_indices_g = np.nonzero(degree > 2)[0]
-    degree_indices_l = np.nonzero(degree <= 2)[0]
+    for i in range(num_nodes):
+        degrees[i] = np.sum(adjacency_binary[i, :]) 
+        if not is_symmetric_adj:
+            degrees[i] += np.sum(adjacency_binary[:, i]) 
 
-    arg_max = np.argmax(degree[degree_indices_g])
-    clust_element = degree_indices_g[arg_max]
+    sorted_degree_indices = np.argsort(degrees)[::-1]
+    
+    if n_clust > num_nodes: # More clusters than nodes: assign each node to its own cluster
+        # And pad with empty clusters if strictly n_clust labels are needed (not typical)
+        # This case usually means n_clust should be num_nodes.
+        # For now, assume n_clust <= num_nodes.
+        # If this error is desired: raise ValueError("Number of clusters cannot exceed number of nodes.")
+        # Or, cap n_clust:
+        n_clust = num_nodes
 
-    cluster_count = 0
-    while cluster_count != n_clust - 1:
-        aux_memb[clust_element] = cluster_count
-        degree_indices_g = np.delete(degree_indices_g, arg_max)
-        if len(degree_indices_g) == 0:
-            break
-        arg_max = np.argmin(cn[clust_element][degree_indices_g])
-        clust_element = degree_indices_g[arg_max]
-        cluster_count += 1
+    seeds = np.zeros(n_clust, dtype=np.int32)
+    
+    # Seed selection: take top n_clust degree nodes if available and distinct enough
+    # Simplified: top n_clust distinct degree nodes.
+    # If fewer than n_clust nodes have edges, some seeds might be 0-degree.
+    
+    # Take top `n_clust` nodes by degree as seeds
+    num_actual_seeds = 0
+    if len(sorted_degree_indices) > 0:
+        for i in range(min(n_clust, len(sorted_degree_indices))):
+            seeds[i] = sorted_degree_indices[i]
+            aux_memb[seeds[i]] = i # Assign seed `i` to cluster `i`
+            num_actual_seeds += 1
+    
+    # If n_clust > num_actual_seeds (e.g. n_clust > num nodes with edges), some clusters are empty.
+    # This logic assumes seeds are assigned labels 0 to n_clust-1.
 
-    if np.unique(aux_memb).shape[0] < n_clust - 1:
-        cluster_count += 1
-        arg_max = np.argmax(degree[degree_indices_l])
-        clust_element = degree_indices_l[arg_max]
-        while cluster_count != n_clust - 1:
-            aux_memb[clust_element] = cluster_count
-            degree_indices_l = np.delete(degree_indices_l, arg_max)
-            if len(degree_indices_l) == 0:
-                raise ValueError(
-                    "The number of clusters is higher thant the nodes number.")
-            arg_max = np.argmin(cn[clust_element][degree_indices_l])
-            clust_element = np.argmin(cn[clust_element][degree_indices_l])
-            cluster_count += 1
+    # Assign remaining non-seed nodes to the cluster of the seed they share most CNs with
+    if num_actual_seeds > 0: # Only if there are seeds
+        for i_node in range(num_nodes):
+            is_seed = False # Check if i_node is already a seed
+            for s_idx in range(num_actual_seeds):
+                if i_node == seeds[s_idx]:
+                    is_seed = True
+                    break
+            if is_seed: continue # Skip seeds, they are already assigned
 
-    aux = np.nonzero(aux_memb == n_clust - 1)[0]
-    np.random.shuffle(aux)
-    for node in aux:
-        if degree[node] < avg_degree:
-            continue
-        aux_list = np.nonzero(aux_memb != n_clust - 1)[0]
-        node_index = aux_list[np.argmax(cn[node, aux_list])]
-        if isinstance(node_index, np.ndarray):
-            node_index = np.random.choice(node_index)
-        aux_memb[node] = aux_memb[node_index]
+            # Assign i_node to a seed's cluster
+            max_cn_to_seed_val = -1.0
+            best_seed_cluster_label = 0 # Default to cluster 0 if no CNs
+            
+            for s_idx in range(num_actual_seeds):
+                seed_node_val = seeds[s_idx]
+                current_cn_val = float(cn[i_node, seed_node_val]) # Ensure float for comparison
+                
+                if current_cn_val > max_cn_to_seed_val:
+                    max_cn_to_seed_val = current_cn_val
+                    best_seed_cluster_label = aux_memb[seed_node_val] # Label of this seed's cluster
+                elif current_cn_val == max_cn_to_seed_val:
+                    # Tie-breaking: prefer smaller cluster label
+                    if aux_memb[seed_node_val] < best_seed_cluster_label:
+                        best_seed_cluster_label = aux_memb[seed_node_val]
+            
+            aux_memb[i_node] = best_seed_cluster_label
+    else: # No seeds (e.g. n_clust = 0 or empty graph with n_clust > 0)
+        # All nodes go to cluster 0 by default init of aux_memb if n_clust=0 or 1.
+        # If n_clust > 1 and no seeds, randomly assign or assign to 0.
+        # Current aux_memb init to zeros covers this.
+        # If n_clust > 1, and graph is empty, this results in all nodes in cluster 0.
+        # If random assignment for empty graph nodes:
+        # for i_node in range(num_nodes): aux_memb[i_node] = np.random.randint(n_clust)
+        pass
+
 
     return aux_memb
 
@@ -410,10 +487,14 @@ def check_adjacency(adjacency, is_sparse, is_directed):
             " 'DirectedGraphClass'.")
 
 
+# Updated
 @jit(nopython=True, fastmath=True)
 def sumLogProbabilities(nextlogp, logp):
-    if nextlogp == 0:
-        stop = True
+    if nextlogp == -np.inf: # Probability 0
+        stop = True # No change to logp
+    elif logp == -np.inf: # Current sum is 0, new term is not 0
+        logp = nextlogp
+        stop = False
     else:
         stop = False
         if nextlogp > logp:
@@ -422,36 +503,38 @@ def sumLogProbabilities(nextlogp, logp):
         else:
             common = logp
             diffexponent = nextlogp - common
+        
+        logp = common + np.log10(1 + 10**diffexponent)
 
-        logp = common + ((np.log10(1 + 10 ** diffexponent)) / np.log10(10))
-
-        if (nextlogp - logp) > -4:
-            stop = True
-
+        if 10**diffexponent < 1e-7: 
+             stop = True
     return logp, stop
 
-
+# update
 @jit(nopython=True, fastmath=True)
 def logc(n, k):
-    if k == n:
-        return 0
-    elif (n > 1000) & (k > 1000):  # Stirling's binomial coeff approximation
-        return logStirFac(n) - logStirFac(k) - logStirFac(n - k)
-    else:
-        t = n - k
-        if t < k:
-            t = k
-        logC = sumRange(t + 1, n) - sumFactorial(n - t)
-        return logC
+    if k < 0 or k > n: 
+        return -np.inf 
+    if k == 0 or k == n:
+        return 0.0 
+    if k > n / 2: 
+        k = n - k
+    
+    res = 0.0
+    for i in range(int(k)): 
+        res += np.log10(n - i) - np.log10(i + 1)
+    return res
 
-
+# update
 @jit(nopython=True, fastmath=True)
 def logStirFac(n):
-    if n <= 1:
-        return 1.0
+    if n <= 1: 
+        return 0.0 
     else:
-        return -n + n * np.log10(n) + np.log10(
-            n * (1 + 4.0 * n * (1.0 + 2.0 * n))) / 6.0 + np.log10(np.pi) / 2.0
+        # Using a common log10 version of Stirling's approximation:
+        # log10(n!) approx n*log10(n) - n*log10(e) + 0.5*log10(2*pi*n)
+        LN10 = np.log(10) # log_e(10)
+        return (n + 0.5) * np.log10(n) - n / LN10 + 0.5 * np.log10(2 * np.pi)
 
 
 @jit(nopython=True, fastmath=True)
@@ -481,19 +564,17 @@ def sumFactorial(n):
 
 
 def shuffled_edges(adjacency_matrix, is_directed):
-    """Shuffles edges randomly.
-
-    :param adjacency_matrix: Matrix.
-    :type adjacency_matrix: numpy.ndarray
-    :param is_directed: True if graph is directed.
-    :type is_directed: bool
-    :return: Shuffled edgelist.
-    :rtype: mumpy.ndarray
-    """
-    adj = adjacency_matrix.astype(bool).astype(np.int16)
+    # Ensure input is numpy array for .T to work as expected
+    adj_np = np.array(adjacency_matrix)
+    adj_bool = adj_np.astype(bool) # Use boolean for structure
+    
     if not is_directed:
-        adj = np.triu(adj)
-    edges = np.stack(adj.nonzero(), axis=-1)
+        # For undirected, only take upper triangle to avoid duplicate edges if adj is symmetric
+        adj_proc = np.triu(adj_bool, k=1) # k=1 to exclude diagonal
+    else:
+        adj_proc = adj_bool
+
+    edges = np.stack(adj_proc.nonzero(), axis=-1)
     np.random.shuffle(edges)
     shuff_edges = edges.astype(np.int32)
     return shuff_edges
