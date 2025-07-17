@@ -289,7 +289,7 @@ def solver_com_det_aglom(
 
         # Now call flipping function with re-labeled assignment and corresponding mem_intr_link_state
         flipped_assignment, flipped_surprise, flipped_mem_link = flipping_function_node_move(
-            # calculate_surprise_func, 
+            calculate_surprise_func, 
             adjacency_matrix, current_cluster_assignment,
             mem_intr_link_state, graph_args, current_surprise,
             approx, is_directed, list_of_neighbors_for_flipping
@@ -388,7 +388,7 @@ def solver_com_det_divis(
         # (correct_partition_labeling_func should ensure dense 0..K-1 before this, K being K_fixed)
         
         new_assignment, new_surprise, new_mem_link_state = flipping_function_node_move(
-            # calculate_surprise_func, 
+            calculate_surprise_func, 
             adjacency_matrix, current_cluster_assignment,
             mem_intr_link_state, graph_args, current_surprise,
             approx, is_directed, list_of_neighbors_for_flipping
