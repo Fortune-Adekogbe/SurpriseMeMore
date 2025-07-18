@@ -514,11 +514,11 @@ class UndirectedGraph:
         is_directed_graph=False,
         print_output=False
     ):
-        n_nodes = self.aux_adj.shape[0]
+        n_nodes = self.adjacency.shape[0]
         if n_nodes == 0:
             return np.array([], dtype=np.int32), 0.0, 1.0 
-
-        adjacency_matrix_binary = (np.array(self.aux_adj) > 0).astype(np.int16)
+        
+        adjacency_matrix_binary = (np.array(self.adjacency) > 0).astype(np.int16)
 
         if isinstance(initial_guess, str):
             if initial_guess == "random":
@@ -557,7 +557,7 @@ class UndirectedGraph:
 
         if method == "agglomerative":
             solution, log_s = solver.solver_com_det_aglom(
-                self.aux_adj, init_guess_partition, num_sim,
+                self.adjacency, init_guess_partition, num_sim,
                 sort_edges_function, surprise_calc_function, cd.labeling_communities,
                 0.1, cd.flipping_function_comdet_agl_new, 
                 approx_method_surprise, is_directed_graph, print_output
@@ -571,7 +571,7 @@ class UndirectedGraph:
             # The solver itself will operate on the K from the initial partition.
             
             solution, log_s = solver.solver_com_det_divis(
-                self.aux_adj, init_guess_partition, num_sim,
+                self.adjacency, init_guess_partition, num_sim,
                 sort_edges_function, surprise_calc_function, cd.labeling_communities,
                 cd.flipping_function_comdet_div_new, 
                 approx_method_surprise, is_directed_graph, print_output
